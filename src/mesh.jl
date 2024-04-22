@@ -4,6 +4,13 @@ using LinearAlgebra
 using Random
 
 using Distributions
+using CUDA
+using Flux
+using Zygote
+
+stop_gradient(f) = f()
+Zygote.@nograd stop_gradient
+
 
 export gen_random_field,gen_mesh,gen_mesh_pair,gen_coarse_from_fine_mesh
 
@@ -19,6 +26,7 @@ struct mesh_struct
     ip # computes inner-product
     integ # integral on the grid
     UPC # unknows per grid cell
+    use_GPU
 end
 
 struct mesh_pair_struct
@@ -89,7 +97,7 @@ end
 
 
 
-function gen_mesh(x,y = nothing, z = nothing;UPC=1)
+function gen_mesh(x,y = nothing, z = nothing;UPC=1,use_GPU = false)
     if y != nothing
         if z != nothing
             x = [x,y,z]
@@ -101,7 +109,7 @@ function gen_mesh(x,y = nothing, z = nothing;UPC=1)
             x = [x]
         end
     end
-
+    T = typeof(x)
     #print(x[1])
     mid_x = [ [(i[j] + i[j+1])/2 for j in 1:(size(i)[1]-1)] for i in x]
 
@@ -139,9 +147,15 @@ function gen_mesh(x,y = nothing, z = nothing;UPC=1)
     dx = cat(sub_dxs...,dims = dims + 1)
     omega = cat([omega for i in 1:UPC]...,dims = dims+1)
 
-    x = cu(reshape(x,(size(x)...,1)))
-    dx = cu(reshape(dx,(size(dx)...,1)))
-    omega = cu(reshape(omega,(size(omega)...,1)))
+    x = reshape(x,(size(x)...,1))
+    dx = reshape(dx,(size(dx)...,1))
+    omega = reshape(omega,(size(omega)...,1))
+
+    if use_GPU
+        x = cu(x)
+        dx = cu(dx)
+        omega = cu(omega)
+    end
 
     function eval_function(F,x = x,dims = dims)
 
@@ -163,17 +177,23 @@ function gen_mesh(x,y = nothing, z = nothing;UPC=1)
         return IP
     end
 
-    function integ(a;weighted = true,omega = omega,dims = dims,ip = ip)
+    function integ(a;weighted = true,omega = omega,dims = dims,ip = ip,use_GPU = use_GPU)
         #channel_a = a[[(:) for i in 1:dims]...,channel:channel,:]
-        some_ones = stop_gradient() do 
-            cu(ones(size(a)))
-        end 
+        if use_GPU
+            some_ones = stop_gradient() do 
+                cu(ones(size(a)))
+            end 
+        else
+            some_ones = stop_gradient() do 
+                ones(size(a))
+            end 
+        end
         return ip(some_ones,a,weighted=weighted,omega=omega,dims=dims,combine_channels = false)
     end
 
 
 
-    return mesh_struct(dims,size(omega)[1:dims],x,dx,x_edges,omega,eval_function,ip,integ,UPC)
+    return mesh_struct(dims,size(omega)[1:dims],x,dx,x_edges,omega,eval_function,ip,integ,UPC,use_GPU)
 end
 
 
@@ -250,16 +270,31 @@ function gen_mesh_pair(fine_mesh,coarse_mesh)
     dims = fine_mesh.dims
     J =Tuple([Int(fine_mesh.N[i]/coarse_mesh.N[i]) for i in 1:dims])
     I = coarse_mesh.N
+    use_GPU = fine_mesh.use_GPU
 
-    one_filter = gen_one_filter(J,UPC) |> gpu
+    
 
-    one_reconstructor = gen_one_reconstructor(J,UPC) |> gpu
+
+    if use_GPU 
+        one_filter = gen_one_filter(J,UPC) |> gpu
+
+        one_reconstructor = gen_one_reconstructor(J,UPC) |> gpu
+    else
+        one_filter = gen_one_filter(J,UPC) 
+
+        one_reconstructor = gen_one_reconstructor(J,UPC) 
+    end
+
+
 
     omega_tilde = fine_mesh.omega
 
-
-    omega_tilde = fine_mesh.omega ./ one_reconstructor(coarse_mesh.omega)
-
+    #print("hoi1")
+    #print(typeof(fine_mesh.omega))
+    #print(typeof(one_reconstructor))
+    #omega_tilde = fine_mesh.omega ./ one_reconstructor(coarse_mesh.omega)
+    omega_tilde = 0
+    #print("hoi2")
 
     return mesh_pair_struct(fine_mesh,coarse_mesh,J,I,one_filter,one_reconstructor,omega_tilde)
 end
@@ -285,5 +320,5 @@ function gen_coarse_from_fine_mesh(fine_mesh,J)
         selector = [1,(1 .+ J[i]*collect(1:I[i]))...]
         push!(X,x[i][selector])
     end
-    return gen_mesh(X,UPC = fine_mesh.UPC)
+    return gen_mesh(X,UPC = fine_mesh.UPC,use_GPU = fine_mesh.use_GPU)
 end
